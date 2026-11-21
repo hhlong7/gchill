@@ -17,24 +17,10 @@ the heuristics (malleable cores, feeding, delay) come later after off and on pha
 
 import time
 from sim.kernels import cpu, accelerator, topological
-from sim.estimate import fits_accel
 from sim.policies.base import Policy
-from sim.policies.cost_model import what_if, running_lanes, play, Lane, segments
 from sim.policies.gchill.costs import cost_table, adjusted_cost_table
 from sim.policies.gchill.plan import core_plan, ilp_plan
 from sim.policies.gchill.priority import descendants, PRIORITY
-
-
-#ns from now till the first kernel on this resource finishes (= it gets free), counting the ones
-#already picked in this pick() as running
-def free_in(kind, sim, starting):
-    lanes = running_lanes(sim)
-    on = {kid: sim.by_id[kid].resource for kid in lanes}
-    for k, where, n in starting:
-        lanes[k.kernel_id] = Lane(segments(k, where, sim, n or 1))
-        on[k.kernel_id] = where
-    finish = play(lanes, sim.config.memory, sim.degradation)
-    return min((t for kid, t in finish.items() if on[kid] == kind), default=0.0)
 
 
 class ContentionILP(Policy):
@@ -63,36 +49,51 @@ class ContentionILP(Policy):
             self.prepare(sim)
         self.ready.append(kernel)
 
-    #where to start this kernel right now, or None = let it wait
-    def choose(self, kernel, free, sim, picks):
+    #when this resource is next free: now if idle, else when the kernel on it should finish
+    def busy_until(self, kernel, sim):
+        return max(sim.now, kernel.start + self.cost[kernel.kernel_id][kernel.resource])
+
+    #where this kernel goes: its planned resource, unless the other one is free right now and
+    #finishes it sooner. finish = when the resource is free (counting the kernels ahead of it in
+    #this pick) + its time there
+    def choose(self, kernel, free_at, free):
+        c = self.cost[kernel.kernel_id]
         planned = self.plan[kernel.kernel_id]
-        if free[planned]:
-            return planned
+        finish = {cpu: free_at[cpu][0] + c[cpu]}
+        if accelerator in c: #only kernels that fit the accelerator have a time there
+            finish[accelerator] = free_at[accelerator] + c[accelerator]
         other = cpu if planned == accelerator else accelerator
-        if not self.override or not free[other]:
-            return None
-        if other == accelerator and not fits_accel(kernel, sim):
-            return None
-        there_now = what_if(kernel, other, sim, starting=picks).time
-        wait_here = free_in(planned, sim, picks) + self.cost[kernel.kernel_id][planned]
-        return other if there_now < wait_here else None
+        if self.override and free[other] and other in finish and finish[other] < finish[planned]:
+            return other, finish[other]
+        return planned, finish[planned]
 
     #sort key: highest rank first, then the one with more kernels after it, then the lowest id
     def order(self, kernel):
         kid = kernel.kernel_id
         return (-self.rank[kid], -self.n_desc[kid], kid)
 
+    #the ready kernels in rank order. each one books its resource, even if it has to wait, so the
+    #kernels after it see the queue it leaves
     def pick(self, sim):
         picks = []
-        free = {cpu: len(sim.cpu.free_cores()) > 0, accelerator: sim.accelerator.free}
         free_cores = len(sim.cpu.free_cores())
+        free = {cpu: free_cores > 0, accelerator: sim.accelerator.free}
+        free_at = { #when each core (soonest first) and the accelerator are free
+            cpu: sorted(sim.now if c.free else self.busy_until(c.current, sim) for c in sim.cpu.cores),
+            accelerator: sim.now if free[accelerator] else self.busy_until(sim.accelerator.current, sim),
+        }
 
         for kernel in sorted(self.ready, key=self.order):
             if not free[cpu] and not free[accelerator]:
                 break
-            kind = self.choose(kernel, free, sim, picks)
-            if kind is None:
-                continue
+            kind, finish = self.choose(kernel, free_at, free)
+            if kind == cpu:
+                free_at[cpu][0] = finish #the core that frees up first is booked till then
+                free_at[cpu].sort()
+            else:
+                free_at[accelerator] = finish
+            if not free[kind]:
+                continue #it waits, but its booking stays
             if kind == accelerator:
                 picks.append((kernel, accelerator, None))
                 free[accelerator] = False
@@ -115,4 +116,3 @@ class ContentionILP(Policy):
         self.solve_ms = (time.perf_counter() - start) * 1e3
         self.rank = PRIORITY[self.priority](self.kernels, self.plan, self.cost, sim)
         self.n_desc = {kid: len(d) for kid, d in descendants(self.kernels).items()}
-        

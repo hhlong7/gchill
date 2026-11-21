@@ -272,3 +272,16 @@ def test_ilp_flag():
     run(ks, off)
     assert off.plan == core_plan(off.kernels, off.cost)
     assert off.T is None
+
+#the big gemm holds the accelerator, 2 smaller gemms planned there arrive together. the 1st one books
+#the accelerator after the big one, so the 2nd sees that queue and starts on the free cpu instead
+@pytest.mark.parametrize("override, where", [(True, cpu), (False, accelerator)])
+def test_override_sees_the_queue(override, where):
+    ks = [make_gmm_kernel(0, 64, 64, 64, arrival=0.0),
+          make_gmm_kernel(1, 16, 64, 32, arrival=10.0),
+          make_gmm_kernel(2, 8, 64, 32, arrival=10.0)]
+    run(ks, ContentionILP(ks, override=override, ilp=False))
+    assert ks[1].resource == accelerator
+    assert ks[2].resource == where
+    if where == cpu:
+        assert ks[2].start == pytest.approx(10.0)
