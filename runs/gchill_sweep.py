@@ -19,6 +19,7 @@ from sim.metrics import summary, gap
 from sim.workload import tree, fork_join, random_dag, fft, gaussian_elimination
 from sim.policies.fifo import Fifo
 from sim.policies.heft_greedy import HeftGreedy
+from sim.policies.heft import Heft
 from sim.policies.qilin_style import QilinStyle
 from sim.policies.contention_aware import ContentionAware
 from sim.policies.optimal import lower_bound
@@ -52,7 +53,7 @@ def families(size):
     }
 
 
-baselines = {"fifo": Fifo, "heft": HeftGreedy, "qilin": QilinStyle, "contention_aware": ContentionAware, "eshcs": Eshcs}
+baselines = {"fifo": Fifo, "heft": Heft, "eft_greedy": HeftGreedy, "qilin": QilinStyle, "contention_aware": ContentionAware, "eshcs": Eshcs}
 
 #gchill flag combinations, one step at a time (the e4 ablation grows here)
 variants = {

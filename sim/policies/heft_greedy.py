@@ -1,5 +1,5 @@
 """
-this is heft greedy (StarPU style):
+this is dynamic eft greedy (StarPU dmda style), not textbook heft (that is heft.py):
 
 each kernel goes to the resource where it's expected to finish the earliest.
 expected finish = when resource is free + how long kernels takes at that resource
