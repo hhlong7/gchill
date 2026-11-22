@@ -19,6 +19,8 @@ the policy (1.8) needs 2 methods:
 """
 
 import time
+import random
+from sim.model import Job, Segment, cpu_segs, accelerator_segs
 from dataclasses import dataclass
 from sim.engine import Engine, queued
 from sim.cores import CPU, Accelerator
@@ -36,7 +38,15 @@ class Run:
     bytes: int #bytes its segments move to or and from the dram
 
 class Simulator:
-    def __init__(self, config, policy, degradation=no_degradation):
+    def __init__(self, config, policy, degradation=no_degradation, noise=0.0, noise_seed=0, bias=None):
+        if not 0 <= noise < 1:
+            raise ValueError(f"noise: {noise} must be in [0, 1)")
+        bias = bias or {}
+        if any(f <= 0 for f in bias.values()):
+            raise ValueError(f"bias: {bias} factors must be positive")
+        self.noise = noise
+        self.bias = bias
+        self.noise_seed = noise_seed
         self.config = config
         self.policy = policy
         self.degradation = degradation
@@ -158,9 +168,18 @@ class Simulator:
             segs = accelerator_segs(kernel, self.accelerator)
         else:
             raise ValueError(f"Unknown resource kind: {kind}")
+        f = self.factor(kernel.kernel_id) * self.bias.get(kind, 1.0)
+        if f != 1.0: #compute and bytes both scale => its time scales by f at any bw, demand stays
+            segs = [Segment(s.compute_ns * f, s.bytes * f) for s in segs]
         self.jobs[kernel.kernel_id] = Job(kernel, segs)
         peak = self.config.memory.dram_bw_bytes_per_s
         self.runs[kernel.kernel_id] = Run(kind, num_cores if kind == cpu else 0, sum(s.duration_ns(peak) for s in segs), sum(s.bytes for s in segs))
+
+    #how much longer (or shorter) this kernel really takes than predicted, 1.0 without noise
+    def factor(self, kernel_id):
+        if self.noise == 0:
+            return 1.0
+        return random.Random(self.noise_seed * 1_000_003 + kernel_id).uniform(1 - self.noise, 1 + self.noise)
 
     def finish(self, job):
         kernel = job.kernel

@@ -245,3 +245,44 @@ def test_bad_deps_raise():
     sim = Simulator(make_system(), Fixed({}))
     with pytest.raises(ValueError):
         sim.submit([mem_bound(0, 0.00), mem_bound(0, 0.00)])    #same id twice
+
+#--- noise: kernels really take predicted x a factor, the policy never sees it ---
+
+def run_fixed(kernels, where, **noise):
+    sim = Simulator(make_system(), Fixed(where), **noise)
+    sim.submit(kernels)
+    return sim.run()
+
+
+#noise 0 and no bias = the exact model, the default
+def test_no_noise_is_exact():
+    assert run_fixed([make_simple_kernel(0, 1000, arrival=0.0)], {0: cpu}, noise=0.0, bias={}) == pytest.approx(400.0)
+
+
+#the factor is in [1 - a, 1 + a], the same for the same (seed, kernel id), different for another seed
+def test_noise_factor():
+    sim = Simulator(make_system(), Fixed({}), noise=0.25, noise_seed=3)
+    fs = [sim.factor(kid) for kid in range(50)]
+    assert all(0.75 <= f <= 1.25 for f in fs)
+    assert fs == [Simulator(make_system(), Fixed({}), noise=0.25, noise_seed=3).factor(kid) for kid in range(50)]
+    assert fs != [Simulator(make_system(), Fixed({}), noise=0.25, noise_seed=4).factor(kid) for kid in range(50)]
+
+
+#a kernel alone takes its factor x its predicted time (compute and bytes both scale)
+def test_noise_scales_the_time():
+    sim = Simulator(make_system(), Fixed({0: cpu}), noise=0.5, noise_seed=1)
+    sim.submit([make_simple_kernel(0, 1000, arrival=0.0)])
+    assert sim.run() == pytest.approx(400.0 * sim.factor(0))
+
+
+#bias: every kernel on that resource is off by the same factor, the other resource is not (each alone)
+def test_bias_per_resource():
+    assert run_fixed([make_simple_kernel(0, 1000, arrival=0.0)], {0: cpu}, bias={cpu: 2.0}) == pytest.approx(800.0)
+    gemm = run_fixed([make_gmm_kernel(0, 10, 32, 32, arrival=0.0)], {0: accelerator}, bias={cpu: 2.0})
+    assert gemm == pytest.approx(run_fixed([make_gmm_kernel(0, 10, 32, 32, arrival=0.0)], {0: accelerator}))
+
+
+@pytest.mark.parametrize("noise", [dict(noise=-0.1), dict(noise=1.0), dict(bias={cpu: 0.0})])
+def test_bad_noise(noise):
+    with pytest.raises(ValueError):
+        Simulator(make_system(), Fixed({}), **noise)
