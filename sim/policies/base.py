@@ -4,6 +4,7 @@ this is the base for every scheduling policy (1.8). the simulator (simulator.py)
 - pick(sim): after every arrival and every kernel finish, returns what to start RIGHT NOW as a
   list of (kernel, kind, num_cores). kind is cpu or accelerator from kernels.py,
   num_cores is ignored for the accelerator. return [] to start nothing
+- on_submit(kernels, sim): once per sim.submit(), before anything runs, to plan the whole dag
 
 rules:
 - dont pick more than whats free, the simulator starts them in order and raises if a resource is busy
@@ -21,6 +22,11 @@ from sim.kernels import accelerator
 
 
 class Policy:
+    #called once per sim.submit(), before anything runs. policies that plan the whole dag up
+    #front (eshcs, the tier 2 ilp) plan here. sim.kernels has every kernel submitted so far
+    def on_submit(self, kernels, sim):
+        pass
+
     #called once when a kernel arrives
     def on_queued(self, kernel, sim):
         pass
@@ -32,3 +38,8 @@ class Policy:
     #called after every arrival and kernel finish, returns [(kernel, kind, num_cores), ...] to start now
     def pick(self, sim):
         return []
+
+    #called once per sim.submit(), before anything runs. policies that plan the whole dag up
+    #front (eshcs, the tier 2 ilp) plan here. sim.kernels has every kernel submitted so far
+    def on_submit(self, kernels, sim):
+        pass
