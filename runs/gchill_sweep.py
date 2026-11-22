@@ -22,6 +22,7 @@ from sim.policies.qilin_style import QilinStyle
 from sim.policies.contention_aware import ContentionAware
 from sim.policies.optimal import lower_bound
 from sim.policies.gchill.ilp import ContentionILP
+from sim.policies.eshcs import Eshcs
 
 
 #the knobs of each family per dag size. kernels per dag: small 14-20, medium 27-40,
@@ -50,7 +51,7 @@ def families(size):
     }
 
 
-baselines = {"fifo": Fifo, "heft": HeftGreedy, "qilin": QilinStyle, "contention_aware": ContentionAware}
+baselines = {"fifo": Fifo, "heft": HeftGreedy, "qilin": QilinStyle, "contention_aware": ContentionAware, "eshcs": Eshcs}
 
 #gchill flag combinations, one step at a time (the e4 ablation grows here)
 variants = {
@@ -60,6 +61,8 @@ variants = {
     "g_ilp_adjusted": dict(ilp=True, adjusted=True), #ilp + adjusted (the current default)
     "g_ilp_adjusted_eshcs": dict(ilp=True, adjusted=True, priority="eshcs"),
     "g_ilp_adjusted_lb": dict(ilp=True, adjusted=True, priority="lower_bound"),
+    "g_static": dict(ilp=False, adjusted=False, override=False),
+    "g_ilp_static": dict(ilp=True, adjusted=False, override=False),
     #rollout on top of g_base, the best greedy so far
     "g_roll1": dict(ilp=False, adjusted=False, rollout_k=1),
     "g_roll2": dict(ilp=False, adjusted=False, rollout_k=2),

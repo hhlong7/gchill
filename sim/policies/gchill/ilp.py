@@ -25,7 +25,7 @@ from sim.policies.gchill.rollout import options, play_out
 
 
 class ContentionILP(Policy):
-    def __init__(self, kernels, override=True, priority="upward", adjusted=True, ilp=True, rollout_k=0):
+    def __init__(self, kernels, override=True, priority="upward", adjusted=False, ilp=False, rollout_k=0):
         
         if priority not in PRIORITY:
             raise ValueError(f"Unknown priority: {priority}, pick one of {list(PRIORITY)}")

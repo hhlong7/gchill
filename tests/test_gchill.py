@@ -263,13 +263,14 @@ def test_ilp_optimal_on_its_estimate(make):
 
 
 #ilp=False keeps the fastest-alone plan, and the policy reports the ilp's estimate and solve time
+#ilp=True runs the ilp and reports its estimate and solve time, the default keeps the fastest-alone plan
 def test_ilp_flag():
     ks = random_dag(seed=0)
-    on = ContentionILP(ks)
+    on = ContentionILP(ks, ilp=True)
     run(ks, on)
     assert on.T > 0 and on.solve_ms >= 0
     ks = random_dag(seed=0)
-    off = ContentionILP(ks, ilp=False)
+    off = ContentionILP(ks)
     run(ks, off)
     assert off.plan == core_plan(off.kernels, off.cost)
     assert off.T is None
