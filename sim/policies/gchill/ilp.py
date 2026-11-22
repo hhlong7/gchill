@@ -22,10 +22,13 @@ from sim.policies.gchill.costs import cost_table, adjusted_cost_table
 from sim.policies.gchill.plan import core_plan, ilp_plan
 from sim.policies.gchill.priority import descendants, PRIORITY
 from sim.policies.gchill.rollout import options, play_out
+from sim.estimate import standalone_ns
+
+min_gain = 0.01 #an extra core has to cut the kernel's time by at least 1% (a memory bound one gains ~0)
 
 
 class ContentionILP(Policy):
-    def __init__(self, kernels, override=True, priority="upward", adjusted=False, ilp=False, rollout_k=0):
+    def __init__(self, kernels, override=True, priority="upward", adjusted=False, ilp=False, rollout_k=0, malleable=False):
         
         if priority not in PRIORITY:
             raise ValueError(f"Unknown priority: {priority}, pick one of {list(PRIORITY)}")
@@ -46,6 +49,7 @@ class ContentionILP(Policy):
         self.solve_ms = None #how long making the plan took (one time cost)
         self.rollout_k = rollout_k #0 = plain greedy, k = try the top k ready kernels, "full" = all of them
         self.n_rollouts = 0 #how many options were played out, the cost of rollout
+        self.malleable = malleable ##the cores left free after a pick go to the cpu picks that gain the most
 
 
     #offline phase, runs once. needs sim for the hardware, so it waits for the 1st arrival
@@ -55,9 +59,20 @@ class ContentionILP(Policy):
             self.prepare(sim)
         self.ready.append(kernel)
 
+        #ns on n cores alone. 1 core = the cost table
+    def cpu_ns(self, kernel, n, sim):
+        if n == 1:
+            return self.cost[kernel.kernel_id][cpu]
+        return standalone_ns(kernel, cpu, sim, n)
+
     #when this resource is next free: now if idle, else when the kernel on it should finish
+    #(on as many cores as it got)
     def busy_until(self, kernel, sim):
-        return max(sim.now, kernel.start + self.cost[kernel.kernel_id][kernel.resource])
+        if kernel.resource == cpu:
+            took = self.cpu_ns(kernel, sim.runs[kernel.kernel_id].num_cores, sim)
+        else:
+            took = self.cost[kernel.kernel_id][accelerator]
+        return max(sim.now, kernel.start + took)
 
     #where this kernel goes: its planned resource, unless the other one is free right now and
     #finishes it sooner. finish = when the resource is free (counting the kernels ahead of it in
@@ -81,7 +96,7 @@ class ContentionILP(Policy):
         #the ready kernels in rank order. each one books its resource, even if it has to wait, so the
     #kernels after it see the queue it leaves. first = (kernel, kind) to start before everyone else.
     #only returns the picks, self.ready doesnt change
-    def greedy(self, sim, first=None):
+    def greedy(self, sim, first=None, widen=True):
         picks = []
         free_cores = len(sim.cpu.free_cores())
         free = {cpu: free_cores > 0, accelerator: sim.accelerator.free}
@@ -118,7 +133,32 @@ class ContentionILP(Policy):
                 free_cores -= 1
                 free[cpu] = free_cores > 0
 
+        if self.malleable and widen and free_cores > 0:
+            picks = self.widen(picks, free_cores, sim)
+
+
         return picks
+
+    #malleable cores: every ready kernel is placed or waits for the accelerator, so the free cores go 1 at a time to the cpu pick
+    #whose time drops the most with 1 more core. a kernel keeps its cores till it finishes
+    def widen(self, picks, spare, sim):
+        picks = [list(p) for p in picks]
+        while spare > 0:
+            best, most = None, 0.0
+            for p in picks:
+                kernel, kind, n = p
+                if kind != cpu or not kernel.parallelize:
+                    continue
+                now = self.cpu_ns(kernel, n, sim)
+                drop = now - self.cpu_ns(kernel, n + 1, sim)
+                if drop > min_gain * now and drop > most:
+                    best, most = p, drop
+            if best is None:
+                break
+            best[2] += 1
+            spare -= 1
+        return [tuple(p) for p in picks]
+
 
     #the greedy's picks, or with rollout the option that finishes the dag first when played out
     def pick(self, sim):

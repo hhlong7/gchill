@@ -9,6 +9,7 @@ options at a pick:
 - each of the top k ready kernels (by rank) started first on each free resource it can use,
   then the greedy fills the other free resources
 - wait: start nothing now (only if something is running), this is how rollout finds a delay
+- with malleable cores: the greedy's pick without the extra cores, so rollout decides if they pay off
 """
 
 
@@ -32,6 +33,12 @@ def options(policy, sim, k):
                     found.append(picks)
     if sim.jobs:
         found.append([])
+
+    if policy.malleable:
+        narrow = policy.greedy(sim, widen=False)
+        if narrow not in found:
+            found.append(narrow)
+            
     return found
 
 #makespan if these picks start now and the greedy does the rest. shared = things that never change,

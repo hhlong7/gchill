@@ -338,3 +338,55 @@ def test_rollout_zero_is_greedy():
 def test_bad_rollout_k():
     with pytest.raises(ValueError):
         ContentionILP(random_dag(seed=0), rollout_k=-1)
+
+#--- heuristics (4): malleable cores ---
+
+#compute bound: 100 ops per element => 10000 ns of compute, 4000 bytes = 400 ns of dram
+def compute_bound(kid, arrival=0.0, deps=()):
+    return make_simple_kernel(kid, 1000, arrival=arrival, ops_per_element=100, deps=deps)
+
+
+#alone with 2 free cores it takes both: speedup 1 + 0.5 => 10000 / 1.5 ns
+@pytest.mark.parametrize("malleable, n, finish", [(True, 2, 10000 / 1.5), (False, 1, 10000.0)])
+def test_malleable_takes_the_spare_core(malleable, n, finish):
+    ks = [compute_bound(0)]
+    sim = run(ks, ContentionILP(ks, malleable=malleable))
+    assert sim.runs[0].num_cores == n
+    assert ks[0].finish == pytest.approx(finish)
+
+
+#memory bound: 100 ns of compute but 400 ns of dram, a 2nd core changes nothing => it stays on 1
+def test_malleable_skips_memory_bound():
+    ks = [make_simple_kernel(0, 1000, arrival=0.0)]
+    sim = run(ks, ContentionILP(ks, malleable=True))
+    assert sim.runs[0].num_cores == 1
+
+
+#2 ready kernels, 2 cores: no core is spare, each gets 1
+def test_malleable_never_takes_a_needed_core():
+    ks = [compute_bound(0), compute_bound(1)]
+    sim = run(ks, ContentionILP(ks, malleable=True))
+    assert sim.runs[0].num_cores == sim.runs[1].num_cores == 1
+    assert ks[0].start == ks[1].start == 0.0
+
+
+#busy_until counts the cores the running kernel got: 2 cores => it ends at 10000 / 1.5, not 10000
+def test_busy_until_counts_the_cores():
+    ks = [compute_bound(0)]
+    policy = ContentionILP(ks, malleable=True)
+    sim = Simulator(make_system(), policy)
+    sim.submit(ks)
+    sim.run(stop=100.0)
+    assert policy.busy_until(ks[0], sim) == pytest.approx(10000 / 1.5)
+
+
+#rollout also tries the pick without the extra cores, and still never loses to its own greedy
+@pytest.mark.parametrize("make", families)
+def test_malleable_rollout_never_worse(make):
+    ks = make()
+    greedy = makespan(run(ks, ContentionILP(ks, malleable=True)))
+    ks = make()
+    sim = run(ks, ContentionILP(ks, malleable=True, rollout_k=1))
+    assert makespan(sim) <= greedy + 1e-6
+    by_id = {k.kernel_id: k for k in ks}
+    assert all(k.start >= by_id[d].finish for k in ks for d in k.deps)

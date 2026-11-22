@@ -68,7 +68,13 @@ variants = {
     "g_roll2": dict(ilp=False, adjusted=False, rollout_k=2),
     "g_roll3": dict(ilp=False, adjusted=False, rollout_k=3),
     "g_roll_full": dict(ilp=False, adjusted=False, rollout_k="full"),
+    #(4) heuristics: malleable cores, on its own and under rollout
+    "g_malleable": dict(malleable=True),
+    "g_roll1_malleable": dict(rollout_k=1, malleable=True),
+    "g_roll3_malleable": dict(rollout_k=3, malleable=True),
 }
+
+
 
 skip = {("xlarge", "g_roll_full")} #(size, policy) pairs too slow to run
 
@@ -107,7 +113,8 @@ def run_one(name, make, seed, config, lb):
 def run_dag(size, bw, fam, seed, policies):
     make = families(size)[fam]
     config = SystemConfig(memory=MemoryConfig(dram_bw_bytes_per_s=bw))
-    lb = lower_bound(make(seed), config)
+    cores = tuple(range(1, config.cores.n_cores + 1)) #every core count a policy may give a kernel
+    lb = lower_bound(make(seed), config, core_options=cores)
     n = len(make(seed))
     return [{"size": size, "bw_gbps": bw / 1e9, "family": fam, "seed": seed, "n_kernels": n,
              **run_one(name, make, seed, config, lb)}
