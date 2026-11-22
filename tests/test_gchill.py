@@ -11,6 +11,7 @@ from sim.policies.gchill.plan import core_plan, ilp_plan
 from sim.policies.gchill.priority import descendants, upward_rank, lower_bound_rank, eshcs_rank, PRIORITY
 from sim.policies.optimal import lower_bound
 from sim.policies.cost_model import segments
+from sim.metrics import makespan
 
 
 #same system as the other tests: 2 cores at 10 gflops, 32 x 32 array at 1 GHz, 10 GB/s dram
@@ -285,3 +286,54 @@ def test_override_sees_the_queue(override, where):
     assert ks[2].resource == where
     if where == cpu:
         assert ks[2].start == pytest.approx(10.0)
+
+
+#--- rollout (3) ---
+
+#at t = 100 kernel 2 arrives, the accelerator is busy and a core is free. by standalone times the cpu
+#finishes it 3 ns sooner, so the greedy starts it there. but on the cpu it fights the accelerator for
+#dram and both slow down. rollout plays both out, sees that, and waits for the accelerator
+def test_rollout_waits_instead_of_contending():
+    def make():
+        return [make_gmm_kernel(0, 16, 64, 16, arrival=0.0),
+                make_gmm_kernel(1, 32, 32, 64, arrival=0.0),
+                make_gmm_kernel(2, 16, 32, 16, arrival=100.0)]
+    ks = make()
+    greedy = run(ks, ContentionILP(ks, ilp=False, adjusted=False))
+    assert ks[2].resource == cpu
+    ks = make()
+    rolled = run(ks, ContentionILP(ks, ilp=False, adjusted=False, rollout_k=1))
+    assert ks[2].resource == accelerator
+    assert makespan(rolled) < makespan(greedy)
+
+
+#the greedy's own pick is always an option and wins ties => never worse than the greedy
+@pytest.mark.parametrize("k", [1, 2, "full"])
+@pytest.mark.parametrize("make", families)
+def test_rollout_never_worse(make, k):
+    ks = make()
+    greedy = makespan(run(ks, ContentionILP(ks)))
+    ks = make()
+    policy = ContentionILP(ks, rollout_k=k)
+    sim = run(ks, policy)
+    assert makespan(sim) <= greedy + 1e-6
+    assert policy.n_rollouts > 0
+    by_id = {k.kernel_id: k for k in ks}
+    assert all(k.start >= by_id[d].finish for k in ks for d in k.deps)
+
+
+#rollout_k = 0 is the plain greedy: same schedule, nothing played out
+def test_rollout_zero_is_greedy():
+    ks = random_dag(seed=0)
+    run(ks, ContentionILP(ks))
+    plain = [(k.kernel_id, k.resource, k.start) for k in ks]
+    ks = random_dag(seed=0)
+    policy = ContentionILP(ks, rollout_k=0)
+    run(ks, policy)
+    assert [(k.kernel_id, k.resource, k.start) for k in ks] == plain
+    assert policy.n_rollouts == 0
+
+
+def test_bad_rollout_k():
+    with pytest.raises(ValueError):
+        ContentionILP(random_dag(seed=0), rollout_k=-1)

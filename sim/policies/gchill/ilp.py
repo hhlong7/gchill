@@ -21,12 +21,17 @@ from sim.policies.base import Policy
 from sim.policies.gchill.costs import cost_table, adjusted_cost_table
 from sim.policies.gchill.plan import core_plan, ilp_plan
 from sim.policies.gchill.priority import descendants, PRIORITY
+from sim.policies.gchill.rollout import options, play_out
 
 
 class ContentionILP(Policy):
-    def __init__(self, kernels, override=True, priority="upward", adjusted=True, ilp=True):
+    def __init__(self, kernels, override=True, priority="upward", adjusted=True, ilp=True, rollout_k=0):
+        
         if priority not in PRIORITY:
             raise ValueError(f"Unknown priority: {priority}, pick one of {list(PRIORITY)}")
+        if rollout_k != "full" and not (isinstance(rollout_k, int) and rollout_k >= 0):
+            raise ValueError(f"rollout_k: {rollout_k} must be an int >= 0 or 'full'")
+        
         self.kernels = topological(kernels)
         self.override = override
         self.priority = priority
@@ -39,7 +44,8 @@ class ContentionILP(Policy):
         self.ilp = ilp #true = ilp plan, else fastest alone (core plan)
         self.T = None #ilp estimated makespan, none without the ilp
         self.solve_ms = None #how long making the plan took (one time cost)
-
+        self.rollout_k = rollout_k #0 = plain greedy, k = try the top k ready kernels, "full" = all of them
+        self.n_rollouts = 0 #how many options were played out, the cost of rollout
 
 
     #offline phase, runs once. needs sim for the hardware, so it waits for the 1st arrival
@@ -72,9 +78,10 @@ class ContentionILP(Policy):
         kid = kernel.kernel_id
         return (-self.rank[kid], -self.n_desc[kid], kid)
 
-    #the ready kernels in rank order. each one books its resource, even if it has to wait, so the
-    #kernels after it see the queue it leaves
-    def pick(self, sim):
+        #the ready kernels in rank order. each one books its resource, even if it has to wait, so the
+    #kernels after it see the queue it leaves. first = (kernel, kind) to start before everyone else.
+    #only returns the picks, self.ready doesnt change
+    def greedy(self, sim, first=None):
         picks = []
         free_cores = len(sim.cpu.free_cores())
         free = {cpu: free_cores > 0, accelerator: sim.accelerator.free}
@@ -82,11 +89,20 @@ class ContentionILP(Policy):
             cpu: sorted(sim.now if c.free else self.busy_until(c.current, sim) for c in sim.cpu.cores),
             accelerator: sim.now if free[accelerator] else self.busy_until(sim.accelerator.current, sim),
         }
+        queue = sorted(self.ready, key=self.order)
+        if first is not None:
+            queue.remove(first[0])
+            queue.insert(0, first[0])
 
-        for kernel in sorted(self.ready, key=self.order):
+        for kernel in queue:
             if not free[cpu] and not free[accelerator]:
                 break
-            kind, finish = self.choose(kernel, free_at, free)
+            if first is not None and kernel is first[0]:
+                kind = first[1]
+                start = free_at[cpu][0] if kind == cpu else free_at[accelerator]
+                finish = start + self.cost[kernel.kernel_id][kind]
+            else:
+                kind, finish = self.choose(kernel, free_at, free)
             if kind == cpu:
                 free_at[cpu][0] = finish #the core that frees up first is booked till then
                 free_at[cpu].sort()
@@ -101,8 +117,22 @@ class ContentionILP(Policy):
                 picks.append((kernel, cpu, 1))
                 free_cores -= 1
                 free[cpu] = free_cores > 0
-            self.ready.remove(kernel)
 
+        return picks
+
+    #the greedy's picks, or with rollout the option that finishes the dag first when played out
+    def pick(self, sim):
+        if self.rollout_k == 0:
+            picks = self.greedy(sim)
+        else:
+            found = options(self, sim, self.rollout_k)
+            picks = found[0]
+            if len(found) > 1:
+                shared = (self.cost, self.rank, self.plan, self.n_desc, sim.config)
+                self.n_rollouts += len(found)
+                picks = min(found, key=lambda p: play_out(sim, p, shared)) #ties => the 1st = greedy
+        for kernel, _, _ in picks:
+            self.ready.remove(kernel)
         return picks
 
     def prepare(self, sim):
