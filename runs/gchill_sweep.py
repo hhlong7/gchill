@@ -10,6 +10,7 @@ run from the repo root: python -m runs.gchill_sweep
 """
 
 import os
+import sys
 from concurrent.futures import ProcessPoolExecutor
 import pandas as pd
 from sim.config import MemoryConfig, SystemConfig
@@ -21,7 +22,7 @@ from sim.policies.heft_greedy import HeftGreedy
 from sim.policies.qilin_style import QilinStyle
 from sim.policies.contention_aware import ContentionAware
 from sim.policies.optimal import lower_bound
-from sim.policies.gchill.ilp import ContentionILP
+from sim.policies.gchill.ilp import ContentionILP, best, best_rollout
 from sim.policies.eshcs import Eshcs
 
 
@@ -72,11 +73,52 @@ variants = {
     "g_malleable": dict(malleable=True),
     "g_roll1_malleable": dict(rollout_k=1, malleable=True),
     "g_roll3_malleable": dict(rollout_k=3, malleable=True),
+        #(4) heuristics on the greedy, one at a time (feeding, harm and pairing lost: kept for e4)
+    "g_harm": dict(harm=True),
+    "g_pairing": dict(pairing=True),
+    "g_feed": dict(feed=True),
+    "g_delay": dict(delay=True),
+    "g_delay_trigger": dict(delay=True, trigger=True),
+    #the final configs (ilp.py presets)
+    "gchill": best,
+    "gchill_rollout": best_rollout,
+}
+
+#e4 ablation, starting from eshcs: {row: (the row it adds to, gchill flags, what kind of step)}.
+#the main chain keeps each piece; a branch is a piece that is tried on its parent and not kept.
+#kind: "contention" = only matters because dram is shared, "general" = would help without contention,
+#"search" = rollout (sees contention through the real rate model, software only)
+e4 = {
+    "e4_static": ("eshcs", dict(override=False, priority="eshcs"), "general"),
+    "e4_override": ("e4_static", dict(priority="eshcs"), "general"),
+    "e4_upward": ("e4_override", dict(), "general"),
+    "e4_malleable": ("e4_upward", dict(malleable=True), "general"),
+    "e4_delay": ("e4_malleable", dict(malleable=True, delay=True), "contention"),
+    "e4_trigger": ("e4_delay", dict(malleable=True, delay=True, trigger=True), "contention"),
+    "e4_roll1": ("e4_trigger", dict(malleable=True, delay=True, trigger=True, rollout_k=1), "search"),
+    "e4_roll3": ("e4_roll1", dict(malleable=True, delay=True, trigger=True, rollout_k=3), "search"),
+    #branches
+    "e4_lb_rank": ("e4_override", dict(priority="lower_bound"), "contention"),
+    "e4_ilp": ("e4_upward", dict(ilp=True), "contention"),
+    "e4_adjusted": ("e4_upward", dict(adjusted=True), "contention"),
+    "e4_harm": ("e4_malleable", dict(malleable=True, harm=True), "contention"),
+    "e4_pairing": ("e4_malleable", dict(malleable=True, pairing=True), "contention"),
+    "e4_feed": ("e4_malleable", dict(malleable=True, feed=True), "general"),
 }
 
 
+#one row per e4 step: its paired change against the row it adds to (compare), mean over all the dags
+#and per bandwidth, and its decision cost
+def e4_table(df):
+    rows = {}
+    us = df.groupby("policy")["sched_per_pick_ns"].mean() / 1e3
+    for name, (parent, _, kind) in e4.items():
+        c = compare(df, name, parent)
+        rows[name] = {"vs": parent, "kind": kind, **c.loc["all"].to_dict(),
+                      **{i: c.loc[i, "mean"] for i in c.index if i.startswith("bw")}, "us_per_pick": us[name]}
+    return pd.DataFrame(rows).T
 
-skip = {("xlarge", "g_roll_full")} #(size, policy) pairs too slow to run
+skip = {("xlarge", "g_roll_full"), ("xlarge", "e4_roll3"), ("xlarge", "gchill_rollout")} #(size, policy) pairs too slow to run
 
 bandwidths = [5e9, 10e9, 25e9, 50e9, 100e9] #low -> high contention is right -> left
 
@@ -84,6 +126,8 @@ bandwidths = [5e9, 10e9, 25e9, 50e9, 100e9] #low -> high contention is right -> 
 def make_policy(name, kernels):
     if name in baselines:
         return baselines[name]()
+    if name in e4:
+        return ContentionILP(kernels, **e4[name][1])
     return ContentionILP(kernels, **variants[name])
 
 
@@ -134,13 +178,42 @@ def sweep(sizes=tuple(sizes), bandwidths=bandwidths, seeds=seeds, policies=None,
             rows = list(pool.map(run_dag, *zip(*jobs)))
     return pd.DataFrame([row for dag in rows for row in dag])
 
+#is a better than b? paired on the same dags: change = a / b - 1 per dag, in %. one row for all the
+#dags, then one per bandwidth and one per size. win/loss = % of dags where a is faster/slower
+def compare(df, a, b):
+    ms = df.pivot_table(index=["size", "bw_gbps", "family", "seed"], columns="policy", values="makespan_ns")
+    change = (ms[a] / ms[b] - 1) * 100
+    def row(c):
+        return {"mean": c.mean(), "win": (c < -1e-9).mean() * 100, "loss": (c > 1e-9).mean() * 100, "worst": c.max()}
+    rows = {"all": row(change)}
+    for level, name in [("bw_gbps", "bw"), ("size", "size")]:
+        for key, c in change.groupby(level=level):
+            rows[f"{name} {key}"] = row(c)
+    return pd.DataFrame(rows).T.round(2)
+
+
+#the dags each phase check runs on: 3 sizes x 5 seeds (xlarge is too slow for a quick check)
+quick = dict(sizes=("small", "medium", "large"), seeds={size: range(5) for size in ("small", "medium", "large")})
 
 #mean gap in %, one row per policy
 def gap_table(df, by):
     return (df.pivot_table(index="policy", columns=by, values="gap", aggfunc="mean") * 100).round(1)
 
 
-if __name__ == "__main__":
+#python -m runs.gchill_sweep compare a b => the quick dags, only a and b, then compare(a, b)
+if __name__ == "__main__" and sys.argv[1:2] == ["compare"]:
+    a, b = sys.argv[2], sys.argv[3]
+    print(compare(sweep(policies=[a, b], **quick), a, b))
+
+#python -m runs.gchill_sweep e4 => eshcs + every e4 row on every dag size, then the step table
+elif __name__ == "__main__" and sys.argv[1:2] == ["e4"]:
+    df = sweep(policies=["eshcs", *e4])
+    os.makedirs("data/results", exist_ok=True)
+    df.to_csv("data/results/e4.csv", index=False)
+    pd.set_option("display.width", 200)
+    print(e4_table(df).round(2))
+
+elif __name__ == "__main__":
     df = sweep()
     os.makedirs("data/results", exist_ok=True)
     df.to_csv("data/results/gchill_sweep.csv", index=False)
