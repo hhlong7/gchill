@@ -10,6 +10,7 @@ from sim.policies.fifo import Fifo
 from sim.policies.heft_greedy import HeftGreedy
 from sim.policies.qilin_style import QilinStyle
 from sim.policies.contention_aware import ContentionAware
+from sim.policies.eshcs import Eshcs
 from sim.policies.optimal import Replay, lower_bounds, lower_bound, start_orders, placements, best_schedule
 
 
@@ -163,7 +164,7 @@ def test_best_schedule_beats_every_policy(workload, config):
     ks = workload()
     best, _, _ = best_schedule(ks, config())
     assert best >= lower_bound(ks, config()) * (1 - 1e-9)
-    for policy in [Fifo, HeftGreedy, QilinStyle, ContentionAware]:
+    for policy in [Fifo, HeftGreedy, QilinStyle, ContentionAware, Eshcs]:
         sim = Simulator(config(), policy())
         sim.submit(fresh(ks))
         assert best <= sim.run() * (1 + 1e-9), policy.__name__

@@ -1,7 +1,13 @@
+import pytest
 from pytest import approx
-from sim.kernels import make_simple_kernel
+
+from sim.config import CoreConfig, AcceleratorConfig, MemoryConfig, SystemConfig
+from sim.kernels import make_gmm_kernel, make_simple_kernel, cpu, accelerator
+from sim.simulator import Simulator
+from sim.workload import tree, fork_join, random_dag, fft, gaussian_elimination
+from sim.policies.fifo import Fifo
 from sim.policies.eshcs import (levels, knapsack, allocate_hw, successors, earliest_start,
-                                critical_path, latest_finish, successor_rank, urgency, priorities)
+                                critical_path, latest_finish, successor_rank, urgency, priorities, Eshcs)
 
 
 def node(kernel_id, deps=()):
@@ -132,3 +138,91 @@ def test_priorities_favor_the_critical_path():
     assert pri[0] == approx(1 + 4 / 3)
     assert pri[1] > pri[2] > pri[4]
 
+
+
+
+
+#part C: the policy in the simulator
+
+#same system as test_scheduling.py: 2 cores at 10 gflops, 32 x 32 array at 1 GHz, 10 GB/s dram
+def make_system(n_cores=2):
+    return SystemConfig(
+        cores=CoreConfig(n_cores=n_cores, gflops_per_core=10.0, multicore_speedup=0.5),
+        accelerator=AcceleratorConfig(rows=32, cols=32, clock_hz=1e9, dtype_bytes=2),
+        memory=MemoryConfig(dram_bw_bytes_per_s=10e9),
+    )
+
+
+def run(kernels, policy, n_cores=2):
+    sim = Simulator(make_system(n_cores), policy)
+    sim.submit(kernels)
+    return sim.run()
+
+
+#big gemm: 332.8 ns on the accelerator vs 2048 on a core => allowed on the accelerator
+#small gemm: 269.8 ns on the accelerator vs 217.6 on a core => never goes there
+def gemms():
+    return [make_gmm_kernel(0, 10, 32, 32, arrival=0.00), make_gmm_kernel(1, 1, 32, 32, arrival=0.00),
+            make_simple_kernel(2, 1000, arrival=0.00)]
+
+
+def test_only_faster_gemms_go_on_the_accelerator():
+    ks = gemms()
+    p = Eshcs(hw_share=1.0)
+    run(ks, p)
+    assert p.on_accel == {0}
+    assert [k.resource for k in ks] == [accelerator, cpu, cpu]
+
+
+#no budget => everything stays on the cpu
+def test_zero_budget_keeps_everything_on_the_cpu():
+    ks = gemms()
+    run(ks, Eshcs(hw_share=0.0))
+    assert all(k.resource == cpu for k in ks)
+
+
+#1 core, 3 memory bound kernels of 400 ns. b is listed first, but a is on the critical path
+#(a -> c = 800 ns), so a has urgency 1 at t = 0 and b only 0.5 => a runs first.
+#at t = 400 b and c both have 400 ns of slack left, both urgency 1, a tie => b (ready first)
+def test_critical_path_kernel_goes_first():
+    b, a = make_simple_kernel(0, 1000, arrival=0.00), make_simple_kernel(1, 1000, arrival=0.00)
+    c = make_simple_kernel(2, 1000, arrival=0.00, deps=[1])
+    run([b, a, c], Eshcs(), n_cores=1)
+    assert a.start == 0.0
+    assert b.start == pytest.approx(a.finish)
+    assert c.start == pytest.approx(b.finish)
+    #fifo would take them in list order: b first
+    b2, a2 = make_simple_kernel(0, 1000, arrival=0.00), make_simple_kernel(1, 1000, arrival=0.00)
+    c2 = make_simple_kernel(2, 1000, arrival=0.00, deps=[1])
+    run([b2, a2, c2], Fifo(), n_cores=1)
+    assert b2.start == 0.0
+
+
+#accelerator kernels wait in line in the order they became ready
+def test_accelerator_kernels_take_turns():
+    ks = [make_gmm_kernel(i, 10, 32, 32, arrival=0.00) for i in range(3)]
+    run(ks, Eshcs(hw_share=1.0))
+    assert [k.resource for k in ks] == [accelerator] * 3
+    assert ks[1].start == pytest.approx(ks[0].finish)
+    assert ks[2].start == pytest.approx(ks[1].finish)
+
+
+#every dag family runs to the end, the inward tree too (its root is listed first)
+@pytest.mark.parametrize("workload", [
+    lambda: tree(levels=4, seed=1), lambda: tree(levels=4, inward=True, seed=2),
+    lambda: fork_join(width=4, stages=3, seed=3), lambda: random_dag(n_nodes=20, seed=4),
+    lambda: fft(points=4, seed=5), lambda: gaussian_elimination(m=5, seed=6),
+])
+@pytest.mark.parametrize("hw_share", [0.0, 0.5, 1.0])
+def test_runs_every_dag_family(workload, hw_share):
+    ks = workload()
+    end = run(ks, Eshcs(hw_share=hw_share))
+    assert all(k.done for k in ks)
+    for k in ks:
+        for d in k.deps:
+            assert k.start >= next(x for x in ks if x.kernel_id == d).finish - 1e-9
+
+
+def test_bad_hw_share():
+    with pytest.raises(ValueError):
+        Eshcs(hw_share=1.5)

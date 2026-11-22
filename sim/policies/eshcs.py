@@ -31,6 +31,9 @@ changes from the paper to our version:
 import numpy as np
 from scipy.optimize import milp, LinearConstraint, Bounds
 
+from sim.kernels import cpu, accelerator, topological
+from sim.estimate import fits_accel, standalone_ns
+from sim.policies.base import Policy
 
 
 # groups by DAG level. level 0 = no dependencies
@@ -180,3 +183,80 @@ def priorities(kernels, et, est, lft, spr, succ, now):
     return prio
 
 
+"""
+part C, the policy the simulator runs.
+
+on_submit (once, before anything runs): the allocation phase
+- w_sw = standalone time on 1 core, w_hw = standalone time on the accelerator (estimate.py)
+- a gemm may go on the accelerator only if it is faster there (w_hw < w_sw)
+- budget = hw_share * total w_hw of those gemms, then allocate_hw (part A)
+- et = w_hw for the kernels it put on the accelerator, w_sw for the rest. then est, the
+  critical path deadline, lft and successor rank (part B). these never change, only "now" does
+
+pick (after every arrival and finish): the scheduling phase
+- accelerator kernels: the paper's fpga starts a ready hardware task right away. ours runs one
+  kernel at a time, so they wait in line in the order they became ready
+- cpu kernels: urgent ones (urgency 1) first, then by priority (eq 11) at the current time,
+  then in the order they became ready. one core each, the paper doesnt split a task
+"""
+
+
+class Eshcs(Policy):
+    def __init__(self, hw_share = 1.0):
+        if not 0 <= hw_share <= 1:
+            raise ValueError(f"hw_share: {hw_share} must be in [0,1]")
+        self.hw_share = hw_share
+        self.on_accel = set()
+        self.accel_line = []
+        self.cpu_ready = []
+
+    # allocation phase
+    def on_submit(self, kernels, sim):
+        ks = topological(sim.kernels)
+        w_sw = {k.kernel_id: standalone_ns(k, cpu, sim) for k in ks}
+        w_hw = {}
+        for k in ks:
+            if fits_accel(k, sim):
+                t = standalone_ns(k, accelerator, sim)
+
+                if t < w_sw[k.kernel_id]:
+                    w_hw[k.kernel_id] = t
+        budget = self.hw_share * sum(w_hw.values())
+        self.on_accel = allocate_hw(levels(ks), w_sw, w_hw, budget)
+
+        self.kernels = ks
+        self.et = {kid: (w_hw[kid] if kid in self.on_accel else w_sw[kid]) for kid in w_sw}
+        self.succ = successors(ks)
+        self.est = earliest_start(ks, self.et)
+        self.lft = latest_finish(ks, self.et, self.succ, critical_path(self.est, self.et))
+        self.spr = successor_rank(self.succ)
+
+
+    def on_queued(self, kernel, sim):
+        if kernel.kernel_id in self.on_accel:
+            self.accel_line.append(kernel)
+        else:
+            self.cpu_ready.append(kernel)
+
+    def pick(self, sim):
+        picks = []
+        if sim.accelerator.free and self.accel_line:
+            picks.append((self.accel_line.pop(0), accelerator, None))
+
+        free_cores = len(sim.cpu.free_cores())
+        if free_cores and self.cpu_ready:
+            now = sim.now
+            pri = priorities(self.kernels, self.et, self.est, self.lft, self.spr, self.succ, now)
+
+            def rank(k):
+                kid = k.kernel_id
+                urgent = urgency(self.et[kid], self.est[kid], self.lft[kid], now) >= 1.0
+
+                return (urgent, pri[kid])
+
+            order = sorted(self.cpu_ready, key = rank, reverse = True)
+            for k in order[:free_cores]:
+                picks.append((k, cpu, 1))
+                self.cpu_ready.remove(k)
+
+        return picks

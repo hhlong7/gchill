@@ -80,6 +80,13 @@ class Simulator:
             self.kernels.append(kernel)
             self.engine.schedule(kernel.queue, queued, kernel)
 
+        on_submit = getattr(self.policy, "on_submit", None) #optional, only planning policies have it
+        if on_submit is not None:
+            t0 = time.perf_counter_ns() #planning counts as scheduler time too
+            on_submit(kernels, self)
+            self.sched_ns += time.perf_counter_ns() - t0
+
+
     def check_no_cycles(self): #check for cycles in the kernel dep graph
         indegree = {kid: len(k.deps) for kid, k in self.by_id.items()}
         free = [kid for kid, n in indegree.items() if n == 0]
