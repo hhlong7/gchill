@@ -38,7 +38,7 @@ def options(policy, sim, k):
         narrow = policy.greedy(sim, widen=False)
         if narrow not in found:
             found.append(narrow)
-            
+
     return found
 
 #makespan if these picks start now and the greedy does the rest. shared = things that never change,
@@ -46,6 +46,7 @@ def options(policy, sim, k):
 def play_out(sim, picks, shared):
     twin = copy.deepcopy(sim, {id(x): x for x in shared})
     twin.policy.rollout_k = 0 #the copy finishes with the plain greedy
+    twin.noise, twin.bias = 0.0, {}
     for kernel, kind, n in picks:
         k = twin.by_id[kernel.kernel_id]
         twin.policy.ready.remove(k)

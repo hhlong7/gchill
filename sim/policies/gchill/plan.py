@@ -28,7 +28,7 @@ def core_plan(kernels, cost):
     return plan
 
 
-def ilp_plan(kernels, cost, sim, relax=False):
+def ilp_plan(kernels, cost, sim, relax=False, release=None):
     n = len(kernels)
     X, F, T = 0, n, 2 * n #where each group starts in the vector
     size = 2 * n + 1
@@ -56,12 +56,14 @@ def ilp_plan(kernels, cost, sim, relax=False):
         rows.append(row)
         low.append(at_least)
 
+    release = release or {} #{kernel id: earliest start ns}, for a re-plan of the kernels not started yet
     for i, k in enumerate(kernels):
-        #it cant finish before its own time: f_i - change_i x_i >= cpu_i
+        #it cant finish before its release + its own time: f_i - change_i x_i >= release_i + cpu_i
         r = np.zeros(size); r[F + i] = 1; r[X + i] = -change[i]
-        add(r, on_cpu[i])
+        add(r, release.get(k.kernel_id, 0.0) + on_cpu[i])
         #or before a dep finishes + its own time: f_i - f_d - change_i x_i >= cpu_i
-        for d in k.deps:
+        #(deps outside this set are done or running, their finish is in the release time)
+        for d in (d for d in k.deps if d in pos):
             r = np.zeros(size); r[F + i] = 1; r[F + pos[d]] = -1; r[X + i] = -change[i]
             add(r, on_cpu[i])
         #the makespan is after every finish: T - f_i >= 0

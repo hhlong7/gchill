@@ -5,7 +5,9 @@ from sim.kernels import make_gmm_kernel, make_simple_kernel, cpu, accelerator, f
 from sim.simulator import Simulator
 from sim.workload import tree, fork_join, random_dag, fft, gaussian_elimination
 from sim.policies.base import Policy
-from sim.policies.gchill.ilp import ContentionILP
+from sim.policies.gchill.ilp import ContentionILP, best, best_rollout
+from sim.policies.gchill.heuristics import feed_bonus, pairing_penalty, should_delay, contended
+from sim.policies.gchill.rollout import play_out
 from sim.policies.gchill.costs import cost_table, adjusted_cost_table, shared_ns
 from sim.policies.gchill.plan import core_plan, ilp_plan
 from sim.policies.gchill.priority import descendants, upward_rank, lower_bound_rank, eshcs_rank, PRIORITY
@@ -390,3 +392,187 @@ def test_malleable_rollout_never_worse(make):
     assert makespan(sim) <= greedy + 1e-6
     by_id = {k.kernel_id: k for k in ks}
     assert all(k.start >= by_id[d].finish for k in ks for d in k.deps)
+
+#--- heuristics (4): pure functions ---
+
+#kernel 0 is the last unfinished dep of gemm 2 (planned on the accelerator) => its accelerator time.
+#while kernel 1 still runs it unlocks nothing, and a cpu-planned child never counts
+def test_feed_bonus():
+    children, deps = {0: [2, 3]}, {2: (0, 1), 3: (0,)}
+    plan = {2: accelerator, 3: cpu}
+    cost = {2: {cpu: 900.0, accelerator: 300.0}, 3: {cpu: 50.0}}
+    assert feed_bonus(0, children, deps, plan, cost, done={1}) == 300.0
+    assert feed_bonus(0, children, deps, plan, cost, done=set()) == 0.0
+
+
+#under the peak nobody loses anything. over it a candidate loses its time x the share dram cant serve,
+#so a compute bound one (small demand) loses less than a memory bound one
+def test_pairing_penalty():
+    assert pairing_penalty(100.0, 4e9, 5e9, 10e9) == 0.0
+    assert pairing_penalty(100.0, 0.0, 50e9, 10e9) == 0.0
+    assert pairing_penalty(100.0, 10e9, 10e9, 10e9) == pytest.approx(50.0)
+    assert pairing_penalty(100.0, 1e9, 10e9, 10e9) < pairing_penalty(100.0, 10e9, 10e9, 10e9)
+
+
+#the same 100 ns of harm delays a kernel if it lands on the critical one (rank = top), not if it lands
+#on one with little behind it. waiting 50 ns costs a kernel at half the top rank 25
+def test_should_delay():
+    rank = {0: 1000.0, 1: 100.0}
+    assert should_delay({0: 100.0}, rank, 1000.0, wait_ns=50.0, my_rank=500.0)
+    assert not should_delay({1: 100.0}, rank, 1000.0, wait_ns=50.0, my_rank=500.0)
+
+
+def test_contended():
+    assert contended([6e9, 5e9], 10e9)
+    assert not contended([6e9, 4e9], 10e9)
+
+
+#--- heuristics (4): in the policy ---
+
+#pdf 2.5: k0 memory bound heads k0 -> k2 -> k3, k1 memory bound and short. without delay k1 slows k0 and
+#the whole chain (148.4 us). with delay k1 waits for k0 and runs next to compute bound k2 (140.4 us)
+def delay_chain():
+    return [make_simple_kernel(0, 100000, arrival=0.0), make_simple_kernel(1, 20000, arrival=0.0),
+            make_simple_kernel(2, 1000, arrival=0.0, ops_per_element=1000, deps=(0,)),
+            make_simple_kernel(3, 1000, arrival=0.0, deps=(2,))]
+
+
+@pytest.mark.parametrize("delay, k1_start, end", [(False, 0.0, 148400.0), (True, 40000.0, 140432.0)])
+def test_delay_waits_for_the_chain(delay, k1_start, end):
+    ks = delay_chain()
+    policy = ContentionILP(ks, delay=delay)
+    sim = run(ks, policy)
+    assert ks[1].start == pytest.approx(k1_start)
+    assert makespan(sim) == pytest.approx(end)
+    assert policy.n_delays == (1 if delay else 0)
+
+
+#with a huge bandwidth dram only fills up during the accelerator's pure load phases (no compute =>
+#infinite demand): the trigger skips most delay checks and the run stays the same
+def test_trigger_skips_when_dram_fits():
+    config = SystemConfig(cores=make_system().cores, accelerator=make_system().accelerator,
+                          memory=MemoryConfig(dram_bw_bytes_per_s=1e15))
+    ks = random_dag(seed=0)
+    always = ContentionILP(ks, delay=True)
+    end = makespan(run(ks, always, config))
+    ks = random_dag(seed=0)
+    gated = ContentionILP(ks, delay=True, trigger=True)
+    assert makespan(run(ks, gated, config)) == pytest.approx(end)
+    assert gated.n_checks < always.n_checks / 2
+
+
+#1 core: k1 (rank 800) beats k0 (rank 400 + its gemm 332.8 = 732.8). with feeding k0 gets the gemm's
+#332.8 ns on top (the accelerator is idle), so it starts first and the gemm starts sooner
+@pytest.mark.parametrize("feed, first", [(False, 1), (True, 0)])
+def test_feed_starts_the_feeder_first(feed, first):
+    ks = [make_simple_kernel(0, 1000, arrival=0.0), make_simple_kernel(1, 1000, arrival=0.0),
+          make_gmm_kernel(2, 10, 32, 32, arrival=0.0, deps=(0,)), make_simple_kernel(3, 1000, arrival=0.0, deps=(1,))]
+    run(ks, ContentionILP(ks, feed=feed), make_system(n_cores=1))
+    assert ks[first].start == 0.0
+    assert ks[2].resource == accelerator
+
+
+#every heuristic finishes every family with the deps respected, alone and all together
+@pytest.mark.parametrize("flags", [dict(harm=True), dict(pairing=True), dict(feed=True), dict(delay=True),
+                                   dict(delay=True, trigger=True),
+                                   dict(malleable=True, harm=True, pairing=True, feed=True, delay=True, trigger=True)])
+@pytest.mark.parametrize("make", families)
+def test_heuristics_finish_everything(make, flags):
+    ks = make()
+    run(ks, ContentionILP(ks, **flags))
+    by_id = {k.kernel_id: k for k in ks}
+    assert all(k.done for k in ks)
+    assert all(k.start >= by_id[d].finish for k in ks for d in k.deps)
+
+
+#--- re-plan (5) ---
+
+def run_noisy(kernels, policy, **noise):
+    sim = Simulator(make_system(), policy, **noise)
+    sim.submit(kernels)
+    sim.run()
+    return sim
+
+
+#a kernel alone with an exact model: actual = predicted, the drift stays 1 and nothing re-plans
+def test_drift_exact_model():
+    ks = [compute_bound(0)]
+    policy = ContentionILP(ks, replan=True)
+    run_noisy(ks, policy)
+    assert policy.drift == {cpu: pytest.approx(1.0), accelerator: 1.0}
+    assert policy.n_replans == 0
+
+
+#cpu kernels really take 2x: a chain of 3 alone, each moves the drift a quarter of the way to 2
+#(measured against the uncorrected prediction, so a re-plan in between doesnt change it)
+def test_drift_follows_the_bias():
+    ks = [make_simple_kernel(i, 1000, arrival=0.0, deps=(i - 1,) if i else ()) for i in range(3)]
+    policy = ContentionILP(ks, replan=True)
+    run_noisy(ks, policy, bias={cpu: 2.0})
+    assert policy.drift[cpu] == pytest.approx(2 - 0.75 ** 3)
+
+
+#gemm chain, 168.4 ns on the accelerator vs 204.8 on a core. the accelerator really takes 2x: after the
+#1st gemm the drift is 1.25 > 15%, the re-plan puts the next ones on the cpu (210.5 > 204.8)
+@pytest.mark.parametrize("replan, end", [(False, 3 * 336.8), (True, 336.8 + 2 * 204.8)])
+def test_replan_moves_the_next_kernels(replan, end):
+    ks = [make_gmm_kernel(i, 2, 16, 32, arrival=0.0, deps=(i - 1,) if i else ()) for i in range(3)]
+    policy = ContentionILP(ks, replan=replan)
+    sim = run_noisy(ks, policy, bias={accelerator: 2.0})
+    assert makespan(sim) == pytest.approx(end)
+    assert policy.n_replans == (1 if replan else 0)
+    if replan:
+        assert [k.resource for k in ks] == [accelerator, cpu, cpu]
+        assert policy.cost[1][accelerator] == pytest.approx(policy.alone[1][accelerator] * 1.25)
+
+
+#threshold = inf never re-plans => the same run as without re-plan, noise or not
+@pytest.mark.parametrize("ilp", [False, True])
+def test_replan_infinite_threshold(ilp):
+    ks = random_dag(seed=0)
+    plain = makespan(run_noisy(ks, ContentionILP(ks, ilp=ilp), noise=0.3))
+    ks = random_dag(seed=0)
+    policy = ContentionILP(ks, ilp=ilp, replan=True, threshold=float("inf"))
+    assert makespan(run_noisy(ks, policy, noise=0.3)) == pytest.approx(plain)
+    assert policy.n_replans == 0
+
+
+#the ilp re-plan of the kernels not started yet keeps every dep, with noise and a bias
+def test_ilp_replan_finishes_everything():
+    ks = fork_join(seed=0)
+    policy = ContentionILP(ks, ilp=True, replan=True)
+    run_noisy(ks, policy, noise=0.3, bias={accelerator: 1.5})
+    by_id = {k.kernel_id: k for k in ks}
+    assert all(k.done for k in ks) and policy.n_replans > 0
+    assert all(k.start >= by_id[d].finish for k in ks for d in k.deps)
+
+
+#rollout's copy runs without noise: playing out from before anything starts on a noisy simulator gives
+#the noiseless makespan, not the real one (the policy only knows the predictions)
+def test_rollout_copy_has_no_noise():
+    def fresh_sim(**noise):
+        ks = random_dag(seed=0)
+        policy = ContentionILP(ks)
+        sim = Simulator(make_system(), policy, **noise)
+        sim.submit(ks)
+        return sim, policy
+    noisy, policy = fresh_sim(noise=0.5, bias={cpu: 1.7})
+    shared = (policy.cost, policy.rank, policy.plan, policy.n_desc, noisy.config)
+    played = play_out(noisy, [], shared) #nothing started yet, the copy runs the whole dag
+    exact, _ = fresh_sim()
+    assert played == pytest.approx(exact.run())
+    assert played != pytest.approx(noisy.run())
+
+
+@pytest.mark.parametrize("bad", [dict(lam=-1.0), dict(threshold=0.0), dict(alpha=0.0), dict(alpha=1.5)])
+def test_bad_heuristic_args(bad):
+    with pytest.raises(ValueError):
+        ContentionILP(random_dag(seed=0), **bad)
+
+
+#the presets only switch on flags that exist, and both finish a dag
+@pytest.mark.parametrize("preset", [best, best_rollout])
+def test_presets(preset):
+    ks = fork_join(seed=0)
+    run(ks, ContentionILP(ks, **preset))
+    assert all(k.done for k in ks)

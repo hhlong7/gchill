@@ -6,4 +6,4 @@ gchill: the new contention-aware scheduling algorithm
 - priority.py: (1) one score per kernel, higher goes first
 """
 
-from sim.policies.gchill.ilp import ContentionILP
+from sim.policies.gchill.ilp import ContentionILP, best, best_rollout
